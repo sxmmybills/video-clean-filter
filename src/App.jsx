@@ -129,13 +129,11 @@ export default function App() {
     const canvasStream = canvas.captureStream(30);
     let combinedStream = canvasStream;
 
+    // Grab audio tracks directly from the video element's stream
+    // This is more reliable on mobile than the Web Audio API approach
     try {
-      const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      audioCtxRef.current = audioCtx;
-      const source = audioCtx.createMediaElementSource(video);
-      const dest = audioCtx.createMediaStreamDestination();
-      source.connect(dest);
-      const audioTracks = dest.stream.getAudioTracks();
+      const videoStream = video.captureStream ? video.captureStream() : video.mozCaptureStream();
+      const audioTracks = videoStream.getAudioTracks();
       if (audioTracks.length > 0) {
         combinedStream = new MediaStream([
           ...canvasStream.getVideoTracks(),
@@ -143,7 +141,25 @@ export default function App() {
         ]);
       }
     } catch {
-      // No audio or unsupported — video only
+      // Fallback: try Web Audio API
+      try {
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        audioCtxRef.current = audioCtx;
+        await audioCtx.resume();
+        const source = audioCtx.createMediaElementSource(video);
+        const dest = audioCtx.createMediaStreamDestination();
+        source.connect(dest);
+        source.connect(audioCtx.destination);
+        const audioTracks = dest.stream.getAudioTracks();
+        if (audioTracks.length > 0) {
+          combinedStream = new MediaStream([
+            ...canvasStream.getVideoTracks(),
+            ...audioTracks,
+          ]);
+        }
+      } catch {
+        // No audio capture available — video only
+      }
     }
 
     const recorder = new MediaRecorder(combinedStream, {
@@ -185,7 +201,8 @@ export default function App() {
       rafRef.current = requestAnimationFrame(drawLoop);
     };
 
-    video.muted = true;
+    // Use volume=0 instead of muted=true — muted can kill the captured audio stream on some browsers
+    video.volume = 0;
 
     // Seek to start and wait for first frame before recording
     try {
