@@ -128,34 +128,45 @@ export default function App() {
 
     const canvasStream = canvas.captureStream(30);
     let combinedStream = canvasStream;
+    let gotAudio = false;
 
-    // Grab audio tracks directly from the video element's stream
-    // This is more reliable on mobile than the Web Audio API approach
-    try {
-      const videoStream = video.captureStream ? video.captureStream() : video.mozCaptureStream();
-      const audioTracks = videoStream.getAudioTracks();
-      if (audioTracks.length > 0) {
-        combinedStream = new MediaStream([
-          ...canvasStream.getVideoTracks(),
-          ...audioTracks,
-        ]);
+    // Method 1: captureStream() — works on Chrome/Android, not on Safari
+    if (!gotAudio && (video.captureStream || video.mozCaptureStream)) {
+      try {
+        const videoStream = video.captureStream ? video.captureStream() : video.mozCaptureStream();
+        const audioTracks = videoStream.getAudioTracks();
+        if (audioTracks.length > 0) {
+          combinedStream = new MediaStream([
+            ...canvasStream.getVideoTracks(),
+            ...audioTracks,
+          ]);
+          gotAudio = true;
+        }
+      } catch {
+        // Not supported — try next method
       }
-    } catch {
-      // Fallback: try Web Audio API
+    }
+
+    // Method 2: Web Audio API — works on Safari/iOS
+    if (!gotAudio) {
       try {
         const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         audioCtxRef.current = audioCtx;
-        await audioCtx.resume();
+        // Must resume after user gesture on mobile
+        if (audioCtx.state === "suspended") {
+          await audioCtx.resume();
+        }
         const source = audioCtx.createMediaElementSource(video);
         const dest = audioCtx.createMediaStreamDestination();
         source.connect(dest);
-        source.connect(audioCtx.destination);
+        // Don't connect to audioCtx.destination — keeps processing silent
         const audioTracks = dest.stream.getAudioTracks();
         if (audioTracks.length > 0) {
           combinedStream = new MediaStream([
             ...canvasStream.getVideoTracks(),
             ...audioTracks,
           ]);
+          gotAudio = true;
         }
       } catch {
         // No audio capture available — video only
@@ -320,7 +331,6 @@ export default function App() {
               preload="metadata"
               className="preview-video"
               controls={phase !== "processing"}
-              muted={phase === "processing"}
             />
             {file && (
               <div className="file-meta">
