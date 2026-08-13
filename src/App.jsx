@@ -175,8 +175,6 @@ export default function App() {
       setPhase("ready");
     };
 
-    recorder.start(200);
-
     const drawLoop = () => {
       if (video.paused || video.ended) return;
       ctx.filter = cssFilter;
@@ -187,21 +185,37 @@ export default function App() {
       rafRef.current = requestAnimationFrame(drawLoop);
     };
 
-    video.currentTime = 0;
     video.muted = true;
 
-    const onEnd = () => {
-      cancelAnimationFrame(rafRef.current);
+    // Seek to start and wait for first frame before recording
+    try {
+      video.currentTime = 0;
+      await new Promise((resolve) => {
+        const onSeeked = () => {
+          video.removeEventListener("seeked", onSeeked);
+          resolve();
+        };
+        video.addEventListener("seeked", onSeeked);
+      });
+
+      // Draw the first frame to canvas BEFORE starting the recorder
       ctx.filter = cssFilter;
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      setTimeout(() => {
-        if (recorder.state === "recording") recorder.stop();
-      }, 300);
-      video.removeEventListener("ended", onEnd);
-    };
-    video.addEventListener("ended", onEnd);
 
-    try {
+      // Now start recording — canvas already has the first frame
+      recorder.start(200);
+
+      const onEnd = () => {
+        cancelAnimationFrame(rafRef.current);
+        ctx.filter = cssFilter;
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        setTimeout(() => {
+          if (recorder.state === "recording") recorder.stop();
+        }, 300);
+        video.removeEventListener("ended", onEnd);
+      };
+      video.addEventListener("ended", onEnd);
+
       await video.play();
       drawLoop();
     } catch {
