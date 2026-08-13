@@ -1,50 +1,44 @@
-import { useState, useRef, useCallback, useEffect } from "react";
+import { useState, useRef, useEffect } from "react";
+import { FFmpeg } from "@ffmpeg/ffmpeg";
+import { fetchFile, toBlobURL } from "@ffmpeg/util";
+
+const CORE_VERSION = "0.12.6";
+const CORE_BASE = `https://unpkg.com/@ffmpeg/core@${CORE_VERSION}/dist/umd`;
 
 const FILTERS = [
-  { id: "none", label: "None", css: "none", desc: "Strip metadata only", emoji: "🚫" },
-  { id: "warm", label: "Warm", css: "sepia(0.1) saturate(1.06)", desc: "Golden tone", emoji: "🔥" },
-  { id: "cool", label: "Cool", css: "hue-rotate(15deg) saturate(1.03) brightness(1.01)", desc: "Blue shift", emoji: "❄️" },
-  { id: "vintage", label: "Vintage", css: "sepia(0.08) contrast(1.03) saturate(0.92) brightness(1.02)", desc: "Retro fade", emoji: "📷" },
-  { id: "dramatic", label: "Dramatic", css: "contrast(1.08) saturate(1.06)", desc: "Bold punch", emoji: "🎭" },
-  { id: "greyscale", label: "Greyscale", css: "grayscale(0.1)", desc: "B&W blend", emoji: "🌑" },
-  { id: "summer", label: "Summer", css: "sepia(0.05) saturate(1.1) brightness(1.03)", desc: "Bright & warm", emoji: "☀️" },
-  { id: "moody", label: "Moody", css: "contrast(1.06) brightness(0.96) saturate(0.94) hue-rotate(5deg)", desc: "Dark & cool", emoji: "🌧️" },
+  { id: "none", label: "None", ffmpeg: null, desc: "Strip metadata only", emoji: "🚫" },
+  { id: "warm", label: "Warm", ffmpeg: "colorchannelmixer=rr=1.03:gg=1.01:bb=0.95,eq=saturation=1.03", desc: "Golden tone", emoji: "🔥" },
+  { id: "cool", label: "Cool", ffmpeg: "colorchannelmixer=rr=0.96:gg=1.0:bb=1.05,eq=saturation=1.02", desc: "Blue shift", emoji: "❄️" },
+  { id: "vintage", label: "Vintage", ffmpeg: "colorchannelmixer=rr=1.02:gg=1.0:bb=0.95:ra=0.02:ga=0.02:ba=0.02,eq=saturation=0.93:contrast=1.02", desc: "Retro fade", emoji: "📷" },
+  { id: "dramatic", label: "Dramatic", ffmpeg: "eq=contrast=1.08:saturation=1.05", desc: "Bold punch", emoji: "🎭" },
+  { id: "greyscale", label: "Greyscale", ffmpeg: "eq=saturation=0.9", desc: "B&W blend", emoji: "🌑" },
+  { id: "summer", label: "Summer", ffmpeg: "colorchannelmixer=rr=1.04:gg=1.02:bb=0.96,eq=saturation=1.06:brightness=0.01", desc: "Bright & warm", emoji: "☀️" },
+  { id: "moody", label: "Moody", ffmpeg: "colorchannelmixer=rr=0.98:gg=0.97:bb=1.04,eq=saturation=0.96:brightness=-0.01", desc: "Dark & cool", emoji: "🌧️" },
 ];
+
+// Singleton FFmpeg instance
+let ff = null;
+let ffReady = false;
 
 export default function App() {
   const [file, setFile] = useState(null);
   const [videoSrc, setVideoSrc] = useState(null);
   const [filter, setFilter] = useState("warm");
-  const [phase, setPhase] = useState("idle");
+  const [phase, setPhase] = useState("idle"); // idle | ready | loading | processing | done | error
   const [progress, setProgress] = useState(0);
+  const [statusMsg, setStatusMsg] = useState("");
   const [outputUrl, setOutputUrl] = useState(null);
-  const [outputType, setOutputType] = useState("video/webm");
   const [error, setError] = useState("");
   const [videoDims, setVideoDims] = useState({ w: 0, h: 0 });
   const [videoDur, setVideoDur] = useState(0);
 
   const videoRef = useRef(null);
-  const canvasRef = useRef(null);
-  const rafRef = useRef(null);
-  const recorderRef = useRef(null);
-  const chunksRef = useRef([]);
-  const audioCtxRef = useRef(null);
 
-  const cleanup = useCallback(() => {
-    if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    if (recorderRef.current && recorderRef.current.state !== "inactive") {
-      try { recorderRef.current.stop(); } catch {}
-    }
-    if (audioCtxRef.current) {
-      try { audioCtxRef.current.close(); } catch {}
-      audioCtxRef.current = null;
-    }
-  }, []);
-
-  useEffect(() => () => {
-    cleanup();
-    if (videoSrc) URL.revokeObjectURL(videoSrc);
-    if (outputUrl) URL.revokeObjectURL(outputUrl);
+  useEffect(() => {
+    return () => {
+      if (videoSrc) URL.revokeObjectURL(videoSrc);
+      if (outputUrl) URL.revokeObjectURL(outputUrl);
+    };
   }, []);
 
   const handleFile = (f) => {
@@ -53,7 +47,6 @@ export default function App() {
       setError("Please select a video file");
       return;
     }
-    cleanup();
     if (videoSrc) URL.revokeObjectURL(videoSrc);
     if (outputUrl) URL.revokeObjectURL(outputUrl);
     setFile(f);
@@ -62,11 +55,11 @@ export default function App() {
     setOutputUrl(null);
     setProgress(0);
     setError("");
+    setStatusMsg("");
   };
 
   const onDrop = (e) => {
     e.preventDefault();
-    e.stopPropagation();
     const f = e.dataTransfer?.files?.[0];
     if (f) handleFile(f);
   };
@@ -78,184 +71,130 @@ export default function App() {
     setVideoDur(v.duration);
   };
 
-  const getSupportedMime = () => {
-    const types = [
-      "video/mp4;codecs=avc1",
-      "video/mp4",
-      "video/webm;codecs=vp9,opus",
-      "video/webm;codecs=vp9",
-      "video/webm;codecs=vp8,opus",
-      "video/webm;codecs=vp8",
-      "video/webm",
-    ];
-    for (const t of types) {
-      if (typeof MediaRecorder !== "undefined" && MediaRecorder.isTypeSupported(t)) return t;
-    }
-    return "";
+  const getInputExt = () => {
+    if (!file) return "mp4";
+    const name = file.name.toLowerCase();
+    if (name.endsWith(".mov")) return "mov";
+    if (name.endsWith(".avi")) return "avi";
+    if (name.endsWith(".mkv")) return "mkv";
+    if (name.endsWith(".webm")) return "webm";
+    return "mp4";
   };
 
-  const getFileExt = (mime) => {
-    if (mime.includes("mp4")) return "mp4";
-    return "webm";
+  const loadFFmpeg = async () => {
+    if (ffReady && ff) return ff;
+
+    setPhase("loading");
+    setStatusMsg("Downloading processor (one-time, ~25 MB)…");
+    setProgress(0);
+
+    try {
+      ff = new FFmpeg();
+
+      ff.on("log", ({ message }) => {
+        console.log("[ffmpeg]", message);
+      });
+
+      const coreURL = await toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, "text/javascript", true, (e) => {
+        if (e.total > 0) setProgress(Math.round((e.received / e.total) * 50));
+      });
+      const wasmURL = await toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm", true, (e) => {
+        if (e.total > 0) setProgress(50 + Math.round((e.received / e.total) * 50));
+      });
+
+      await ff.load({ coreURL, wasmURL });
+      ffReady = true;
+      return ff;
+    } catch (err) {
+      console.error("FFmpeg load error:", err);
+      setError("Failed to download the video processor. Check your internet and try again.");
+      setPhase("ready");
+      ff = null;
+      ffReady = false;
+      return null;
+    }
   };
 
   const process = async () => {
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    if (!video || !canvas) return;
+    if (!file) return;
+    setError("");
 
-    if (typeof MediaRecorder === "undefined") {
-      setError("Your browser doesn't support MediaRecorder. Try Chrome or Safari 14+.");
-      return;
-    }
-
-    const mime = getSupportedMime();
-    if (!mime) {
-      setError("No supported video codec found in your browser.");
-      return;
-    }
+    const ffmpeg = await loadFFmpeg();
+    if (!ffmpeg) return;
 
     setPhase("processing");
     setProgress(0);
-    setError("");
-    setOutputType(mime);
+    setStatusMsg("Processing video…");
 
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const ctx = canvas.getContext("2d");
-    const filterObj = FILTERS.find((f) => f.id === filter) || FILTERS[0];
-    const cssFilter = filterObj.css;
-
-    const canvasStream = canvas.captureStream(30);
-    let combinedStream = canvasStream;
-    let gotAudio = false;
-
-    // Method 1: captureStream() — works on Chrome/Android, not on Safari
-    if (!gotAudio && (video.captureStream || video.mozCaptureStream)) {
-      try {
-        const videoStream = video.captureStream ? video.captureStream() : video.mozCaptureStream();
-        const audioTracks = videoStream.getAudioTracks();
-        if (audioTracks.length > 0) {
-          combinedStream = new MediaStream([
-            ...canvasStream.getVideoTracks(),
-            ...audioTracks,
-          ]);
-          gotAudio = true;
+    try {
+      // Progress tracking
+      ffmpeg.on("progress", ({ progress: p }) => {
+        if (p > 0 && p <= 1) {
+          setProgress(Math.round(Math.min(99, p * 100)));
         }
-      } catch {
-        // Not supported — try next method
+      });
+
+      const ext = getInputExt();
+      const inputName = `input.${ext}`;
+      const outputName = "output.mp4";
+
+      // Write input file to FFmpeg virtual filesystem
+      setStatusMsg("Reading video…");
+      await ffmpeg.writeFile(inputName, await fetchFile(file));
+
+      // Build FFmpeg command
+      const filterObj = FILTERS.find((f) => f.id === filter) || FILTERS[0];
+      const cmd = ["-i", inputName];
+
+      // Strip all metadata
+      cmd.push("-map_metadata", "-1", "-fflags", "+bitexact");
+
+      // Apply filter if selected
+      if (filterObj.ffmpeg) {
+        cmd.push("-vf", filterObj.ffmpeg);
       }
-    }
 
-    // Method 2: Web Audio API — works on Safari/iOS
-    if (!gotAudio) {
-      try {
-        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-        audioCtxRef.current = audioCtx;
-        // Must resume after user gesture on mobile
-        if (audioCtx.state === "suspended") {
-          await audioCtx.resume();
-        }
-        const source = audioCtx.createMediaElementSource(video);
-        const dest = audioCtx.createMediaStreamDestination();
-        source.connect(dest);
-        // Don't connect to audioCtx.destination — keeps processing silent
-        const audioTracks = dest.stream.getAudioTracks();
-        if (audioTracks.length > 0) {
-          combinedStream = new MediaStream([
-            ...canvasStream.getVideoTracks(),
-            ...audioTracks,
-          ]);
-          gotAudio = true;
-        }
-      } catch {
-        // No audio capture available — video only
-      }
-    }
+      // Encode as H.264/AAC — TikTok/Instagram/YouTube compatible
+      cmd.push(
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "20",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-movflags", "+faststart",
+        "-y",
+        outputName
+      );
 
-    const recorder = new MediaRecorder(combinedStream, {
-      mimeType: mime,
-      videoBitsPerSecond: 5_000_000,
-    });
-    recorderRef.current = recorder;
-    chunksRef.current = [];
+      setStatusMsg("Encoding…");
+      await ffmpeg.exec(cmd);
 
-    recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
-    };
-
-    recorder.onstop = () => {
-      const blob = new Blob(chunksRef.current, { type: mime });
+      // Read output
+      const data = await ffmpeg.readFile(outputName);
       if (outputUrl) URL.revokeObjectURL(outputUrl);
+      const blob = new Blob([data.buffer], { type: "video/mp4" });
       const url = URL.createObjectURL(blob);
       setOutputUrl(url);
       setPhase("done");
       setProgress(100);
-      if (audioCtxRef.current) {
-        try { audioCtxRef.current.close(); } catch {}
-        audioCtxRef.current = null;
-      }
-    };
+      setStatusMsg("");
 
-    recorder.onerror = () => {
-      setError("Recording failed. Try a shorter video or different browser.");
-      setPhase("ready");
-    };
+      // Cleanup virtual filesystem
+      try {
+        await ffmpeg.deleteFile(inputName);
+        await ffmpeg.deleteFile(outputName);
+      } catch {}
 
-    const drawLoop = () => {
-      if (video.paused || video.ended) return;
-      ctx.filter = cssFilter;
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      if (video.duration) {
-        setProgress(Math.min(99, Math.round((video.currentTime / video.duration) * 100)));
-      }
-      rafRef.current = requestAnimationFrame(drawLoop);
-    };
-
-    // Use volume=0 instead of muted=true — muted can kill the captured audio stream on some browsers
-    video.volume = 0;
-
-    // Seek to start and wait for first frame before recording
-    try {
-      video.currentTime = 0;
-      await new Promise((resolve) => {
-        const onSeeked = () => {
-          video.removeEventListener("seeked", onSeeked);
-          resolve();
-        };
-        video.addEventListener("seeked", onSeeked);
-      });
-
-      // Draw the first frame to canvas BEFORE starting the recorder
-      ctx.filter = cssFilter;
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-      // Now start recording — canvas already has the first frame
-      recorder.start(200);
-
-      const onEnd = () => {
-        cancelAnimationFrame(rafRef.current);
-        ctx.filter = cssFilter;
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        setTimeout(() => {
-          if (recorder.state === "recording") recorder.stop();
-        }, 300);
-        video.removeEventListener("ended", onEnd);
-      };
-      video.addEventListener("ended", onEnd);
-
-      await video.play();
-      drawLoop();
-    } catch {
-      setError("Couldn't play video for processing. Try tapping Process again.");
+    } catch (err) {
+      console.error("Processing error:", err);
+      setError("Processing failed. The video format may not be supported, or your device ran out of memory. Try a shorter clip.");
       setPhase("ready");
     }
   };
 
   const download = () => {
     if (!outputUrl) return;
-    const ext = getFileExt(outputType);
-    const name = file ? file.name.replace(/\.[^.]+$/, "") + `_clean.${ext}` : `clean_video.${ext}`;
+    const name = file ? file.name.replace(/\.[^.]+$/, "") + "_clean.mp4" : "clean_video.mp4";
     const a = document.createElement("a");
     a.href = outputUrl;
     a.download = name;
@@ -271,7 +210,6 @@ export default function App() {
   };
 
   const reset = () => {
-    cleanup();
     if (videoSrc) URL.revokeObjectURL(videoSrc);
     if (outputUrl) URL.revokeObjectURL(outputUrl);
     setFile(null);
@@ -280,6 +218,7 @@ export default function App() {
     setProgress(0);
     setOutputUrl(null);
     setError("");
+    setStatusMsg("");
   };
 
   const formatDur = (s) => {
@@ -294,6 +233,8 @@ export default function App() {
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   };
+
+  const isWorking = phase === "loading" || phase === "processing";
 
   return (
     <div className="wrap">
@@ -325,16 +266,16 @@ export default function App() {
           <div className="preview-wrap">
             <video
               ref={videoRef}
-              src={videoSrc}
+              src={phase === "done" ? outputUrl : videoSrc}
               onLoadedMetadata={onVideoLoaded}
               playsInline
               preload="metadata"
               className="preview-video"
-              controls={phase !== "processing"}
+              controls={!isWorking}
             />
             {file && (
               <div className="file-meta">
-                <span>{file.name}</span>
+                <span>{phase === "done" ? file.name.replace(/\.[^.]+$/, "") + "_clean.mp4" : file.name}</span>
                 <span className="dot">·</span>
                 <span>{formatSize(file.size)}</span>
                 {videoDur > 0 && (
@@ -368,9 +309,9 @@ export default function App() {
               {FILTERS.map((f) => (
                 <button
                   key={f.id}
-                  onClick={() => phase !== "processing" && setFilter(f.id)}
+                  onClick={() => !isWorking && setFilter(f.id)}
                   className={`filter-card ${filter === f.id ? "active" : ""}`}
-                  disabled={phase === "processing"}
+                  disabled={isWorking}
                 >
                   <span className="filter-emoji">{f.emoji}</span>
                   <span className="filter-label">{f.label}</span>
@@ -380,16 +321,17 @@ export default function App() {
             </div>
           </div>
 
-          {phase === "processing" && (
+          {isWorking && (
             <div className="progress-wrap">
-              <div className="progress-label">Processing… {progress}%</div>
+              <div className="progress-label">{statusMsg} {progress > 0 ? `${progress}%` : ""}</div>
               <div className="progress-track">
                 <div className="progress-bar" style={{ width: `${progress}%` }} />
               </div>
-              <div className="progress-hint">
-                Video plays through once to re-encode with filter.
-                {videoDur > 60 && " This may take a minute for longer videos."}
-              </div>
+              {phase === "loading" && (
+                <div className="progress-hint">
+                  First time only — gets cached for next time.
+                </div>
+              )}
             </div>
           )}
 
@@ -416,7 +358,7 @@ export default function App() {
               </>
             )}
 
-            {phase !== "processing" && (
+            {!isWorking && (
               <button onClick={reset} className="btn ghost">
                 {phase === "done" ? "Process Another" : "Change Video"}
               </button>
@@ -425,10 +367,9 @@ export default function App() {
         </>
       )}
 
-      <canvas ref={canvasRef} style={{ display: "none" }} />
-
       <footer className="footer">
         Runs entirely in your browser — nothing uploaded anywhere.
+        {ffReady && " ⚡ Processor cached."}
       </footer>
     </div>
   );
