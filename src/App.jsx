@@ -3,7 +3,6 @@ import { FFmpeg } from "@ffmpeg/ffmpeg";
 import { fetchFile, toBlobURL } from "@ffmpeg/util";
 
 const CORE_VERSION = "0.12.6";
-const CORE_BASE = `https://unpkg.com/@ffmpeg/core@${CORE_VERSION}/dist/umd`;
 
 const FILTERS = [
   { id: "none", label: "None", ffmpeg: null, desc: "Strip metadata only", emoji: "🚫" },
@@ -85,7 +84,7 @@ export default function App() {
     if (ffReady && ff) return ff;
 
     setPhase("loading");
-    setStatusMsg("Downloading processor (one-time, ~25 MB)…");
+    setStatusMsg("Downloading processor (one-time)…");
     setProgress(0);
 
     try {
@@ -95,14 +94,29 @@ export default function App() {
         console.log("[ffmpeg]", message);
       });
 
-      const coreURL = await toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, "text/javascript", true, (e) => {
-        if (e.total > 0) setProgress(Math.round((e.received / e.total) * 50));
-      });
-      const wasmURL = await toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm", true, (e) => {
-        if (e.total > 0) setProgress(50 + Math.round((e.received / e.total) * 50));
-      });
+      // Try loading from unpkg first, then jsdelivr as fallback
+      const cdns = [
+        `https://unpkg.com/@ffmpeg/core@${CORE_VERSION}/dist/umd`,
+        `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${CORE_VERSION}/dist/umd`,
+      ];
 
-      await ff.load({ coreURL, wasmURL });
+      let loaded = false;
+      for (const base of cdns) {
+        try {
+          const coreURL = await toBlobURL(`${base}/ffmpeg-core.js`, "text/javascript");
+          setProgress(50);
+          const wasmURL = await toBlobURL(`${base}/ffmpeg-core.wasm`, "application/wasm");
+          setProgress(90);
+          await ff.load({ coreURL, wasmURL });
+          loaded = true;
+          break;
+        } catch {
+          console.warn(`Failed to load from ${base}, trying next…`);
+        }
+      }
+
+      if (!loaded) throw new Error("All CDNs failed");
+
       ffReady = true;
       return ff;
     } catch (err) {
